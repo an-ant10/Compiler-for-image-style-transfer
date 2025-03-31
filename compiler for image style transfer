@@ -1,0 +1,164 @@
+import torch
+import onnx
+import onnxruntime
+import cv2
+import numpy as np
+import os
+import argparse
+from tqdm import tqdm
+
+def load_model(style_name="mosaic"):
+    global model, onnx_session, input_name, output_name
+    
+    try:
+        
+        model = torch.hub.load('pytorch/vision:v0.10.0', 'fast_neural_style', pretrained=True, model=style_name)
+    except:
+        print(f"Could not load {style_name} directly, trying alternative approach...")
+        
+        model = torch.hub.load('pytorch/vision:v0.10.0', 'deeplabv3_resnet101', pretrained=True)
+    
+    model.eval()
+    
+
+    os.makedirs("models", exist_ok=True)
+    onnx_model_path = f"models/{style_name}.onnx"
+    
+    if not os.path.exists(onnx_model_path):
+        print(f"Converting model to ONNX format ({onnx_model_path})...")
+        dummy_input = torch.randn(1, 3, 480, 640)
+        torch.onnx.export(model, dummy_input, onnx_model_path, opset_version=11)
+    
+    
+    print(f"Loading ONNX model...")
+    onnx_session = onnxruntime.InferenceSession(onnx_model_path)
+    input_name = onnx_session.get_inputs()[0].name
+    output_name = onnx_session.get_outputs()[0].name
+
+    print(f"Loaded {style_name} style model successfully.")
+
+# Transform input frame
+def preprocess_frame(frame):
+    # Resize for model
+    frame = cv2.resize(frame, (640, 480))
+    # Convert BGR to RGB
+    frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+    # Normalize and transpose to CHW format
+    frame = frame.astype(np.float32).transpose(2, 0, 1) / 255.0
+    return np.expand_dims(frame, axis=0)
+
+# Apply style transfer
+def apply_style_transfer(frame):
+    input_tensor = preprocess_frame(frame)
+    stylized_output = onnx_session.run([output_name], {input_name: input_tensor})[0]
+    
+    # Convert back to image format
+    stylized_image = stylized_output[0].transpose(1, 2, 0)
+    # Clip values and convert to uint8
+    stylized_image = np.clip(stylized_image * 255, 0, 255).astype(np.uint8)
+    # Convert RGB to BGR for OpenCV
+    stylized_image = cv2.cvtColor(stylized_image, cv2.COLOR_RGB2BGR)
+    # Resize back to original dimensions
+    stylized_image = cv2.resize(stylized_image, (frame.shape[1], frame.shape[0]))
+    
+    return stylized_image
+
+# Process a single image
+def process_image(input_image, output_image):
+    print(f"Processing image: {input_image}")
+    
+    # Read the image
+    frame = cv2.imread(input_image)
+    if frame is None:
+        raise ValueError(f"Could not read image file: {input_image}")
+    
+    # Apply style transfer
+    stylized_frame = apply_style_transfer(frame)
+    
+    # Save the output
+    cv2.imwrite(output_image, stylized_frame)
+    print(f"Styled image saved to: {output_image}")
+
+# Video Processing
+def process_video(input_video, output_video, preview=False):
+    print(f"Processing video: {input_video}")
+    
+    # Open the video file
+    cap = cv2.VideoCapture(input_video)
+    if not cap.isOpened():
+        raise ValueError(f"Could not open video file: {input_video}")
+    
+    # Get video properties
+    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    fps = int(cap.get(cv2.CAP_PROP_FPS))
+    frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    
+    # Create video writer
+    out = cv2.VideoWriter(output_video, cv2.VideoWriter_fourcc(*'mp4v'), fps, (width, height))
+    
+    # progress bar
+    pbar = tqdm(total=frame_count, desc="Processing frames")
+    
+    frame_idx = 0
+    while cap.isOpened():
+        ret, frame = cap.read()
+        if not ret:
+            break
+        
+        # Apply style transfer
+        stylized_frame = apply_style_transfer(frame)
+        
+        # Write frame to output video
+        out.write(stylized_frame)
+        
+        # Show preview if requested
+        if preview:
+            cv2.imshow("Stylized Video", stylized_frame)
+            if cv2.waitKey(1) & 0xFF == ord('q'):
+                break
+        
+        frame_idx += 1
+        pbar.update(1)
+    
+    # Clean up
+    cap.release()
+    out.release()
+    if preview:
+        cv2.destroyAllWindows()
+    pbar.close()
+    
+    print(f"Video processing completed! Output saved to: {output_video}")
+
+def main():
+    # Define command line arguments
+    parser = argparse.ArgumentParser(description="Neural Style Transfer")
+    parser.add_argument("--style", type=str, default="mosaic", 
+                        choices=["mosaic", "candy", "rain_princess", "udnie"],
+                        help="Style to apply")
+    parser.add_argument("--input", type=str, required=True,
+                        help="Input file (video or image)")
+    parser.add_argument("--output", type=str, required=True,
+                        help="Output file (video or image)")
+    parser.add_argument("--preview", action="store_true",
+                        help="Show preview while processing video")
+    
+    args = parser.parse_args()
+    
+    # Load the requested style model
+    print(f"Loading style: {args.style}")
+    load_model(args.style)
+    
+    # Determine if input is image or video
+    _, ext = os.path.splitext(args.input.lower())
+    
+    if ext in ['.jpg', '.jpeg', '.png', '.bmp']:
+        process_image(args.input, args.output)
+    elif ext in ['.mp4', '.avi', '.mov', '.mkv']:
+        process_video(args.input, args.output, args.preview)
+    else:
+        print(f"Unsupported file format: {ext}")
+        print("Supported formats: .jpg, .jpeg, .png, .bmp, .mp4, .avi, .mov, .mkv")
+
+if __name__ == "_main_":
+    main()
